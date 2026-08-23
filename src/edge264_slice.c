@@ -1174,8 +1174,10 @@ static void CAFUNC(parse_B_sub_mb) {
 					0x1b, 0, 0, 0x0a, 0x11, 0x0a, 0};
 				mvd_flags |= sub2flags[sub] << i4x4;
 				mb->f.inter_eqs[i8x8] = sub2eqs[sub];
+				#if LOGS
 				static const uint8_t sub2mb_type[13] = {3, 4, 5, 6, 1, 2, 11, 12, 7, 8, 9, 10, 0};
 				log_mb(ctx, (i8x8 < 3) ? "%u," : "%u]\n", sub2mb_type[sub]);
+				#endif
 			#endif
 			if (CACOND(0x015f & 1 << sub_mb_type, 0x23b & 1 << sub)) { // 8xN
 				ctx->unavail4x4[i4x4] = (ctx->unavail4x4[i4x4] & 11) | (ctx->unavail4x4[i4x4 + 1] & 4);
@@ -1375,9 +1377,11 @@ static void CAFUNC(parse_B_mb)
 		}
 		if (str == 13)
 			CAJUMP(parse_I_mb, 32);
+		#if LOGS
 		static const uint8_t str2mb_type[26] = {3, 4, 5, 6, 7, 8, 9, 10, 1, 2, 0, 0,
 			0, 0, 11, 22, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21};
 		log_mb(ctx, "%smb_type: %u\n", ctx->log_indent, str2mb_type[str]);
+		#endif
 		mb->refIdx_l = -1;
 		mb->mvs_v[0] = mb->mvs_v[1] = mb->mvs_v[2] = mb->mvs_v[3] = mb->mvs_v[4] = mb->mvs_v[5] = mb->mvs_v[6] = mb->mvs_v[7] = (i16x8){};
 		if (str == 15)
@@ -1676,14 +1680,7 @@ static noinline void CAFUNC(parse_slice_data)
 	int end_of_slice_flag = 0;
 	do {
 		#ifdef LOGS
-			if (ctx->thread_id < 0) {
-				log_mb(ctx, "  - mbAddr: %u\n", ctx->CurrMbAddr);
-			} else {
-				log_mb(ctx, "\n- thread_id: %d\n"
-					"  FrameId: %u\n"
-					"  mbAddr: %u\n",
-					ctx->thread_id, ctx->t.FrameId, ctx->CurrMbAddr);
-			}
+			log_mb(ctx, "  - mbAddr: %u\n", ctx->CurrMbAddr);
 		#endif
 		
 		// update flip_bit atomically to signal mb is a priori decoded, otherwise end the slice
@@ -1693,7 +1690,7 @@ static noinline void CAFUNC(parse_slice_data)
 		
 		// set and reset neighbouring pointers depending on their availability
 		int unavail16x16 = (ctx->mbx == 0 ? 9 : 0) | (ctx->mbx == ctx->t.pic_width_in_mbs - 1) << 2 | (ctx->mby == 0 ? 14 : 0);
-		int filter_edges = 4 | 3 & ~unavail16x16;
+		int filter_edges = 4 | (3 & ~unavail16x16);
 		mbA = mb - 1;
 		mbB = mbA - ctx->t.pic_width_in_mbs;
 		mbC = mbB + 1;
@@ -1840,11 +1837,8 @@ static noinline void CAFUNC(parse_slice_data)
 			ctx->samples_mb[1] += ctx->t.stride[1] * 8 - ctx->t.pic_width_in_mbs * 8; // FIXME 4:2:2
 			ctx->samples_mb[2] += ctx->t.stride[1] * 8 - ctx->t.pic_width_in_mbs * 8;
 			if (ctx->t.next_deblock_idc >= 0) {
-				__atomic_store_n(&ctx->d->next_deblock_addr[ctx->t.next_deblock_idc],
-					(ctx->t.disable_deblocking_filter_idc != 1) ? ctx->t.next_deblock_addr : ctx->CurrMbAddr,
-					__ATOMIC_RELEASE);
-				// not locking mutex here is fine since the last progress broadcast will lock it
-				pthread_cond_broadcast(&ctx->d->task_progress);
+				ctx->d->next_deblock_addr[ctx->t.next_deblock_idc] =
+					(ctx->t.disable_deblocking_filter_idc != 1) ? ctx->t.next_deblock_addr : ctx->CurrMbAddr;
 			}
 			if (ctx->mby >= ctx->t.pic_height_in_mbs)
 				return;

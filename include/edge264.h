@@ -42,36 +42,82 @@ typedef void (*Edge264UnrefCb)(int ret, void *unref_arg);
 typedef void (*Edge264AllocCb)(void **samples, unsigned samples_size, void **mbs, unsigned mbs_size, int errno_on_fail, void *alloc_arg);
 typedef void (*Edge264FreeCb)(void *samples, void *mbs, void *alloc_arg);
 
+typedef struct Edge264Picture {
+	const uint8_t *data[3]; // Y/Cb/Cr planes
+	int16_t width;
+	int16_t pitch;
+	int16_t height;
+	uint8_t has_errors;
+	uint64_t pts;
+	uint64_t dts;
+	void *opaque;
+	uint8_t idr_picture_flag;
+	uint8_t profile_idc;
+	uint8_t level_idc;
+	uint32_t pic_width_in_mbs_minus1;
+	uint32_t pic_height_in_map_units_minus1;
+	uint8_t frame_mbs_only_flag;
+	uint8_t frame_cropping_flag;
+	uint32_t frame_crop_left_offset;
+	uint32_t frame_crop_right_offset;
+	uint32_t frame_crop_top_offset;
+	uint32_t frame_crop_bottom_offset;
+	uint8_t aspect_ratio_info_present_flag;
+	uint8_t aspect_ratio_idc;
+	uint16_t sar_width;
+	uint16_t sar_height;
+	uint8_t video_signal_type_present_flag;
+	uint8_t video_format;
+	uint8_t video_full_range_flag;
+	uint8_t colour_description_present_flag;
+	uint8_t colour_primaries;
+	uint8_t transfer_characteristics;
+	uint8_t matrix_coefficients;
+	uint8_t timing_info_present_flag;
+	uint32_t num_units_in_tick;
+	uint32_t time_scale;
+	uint8_t fixed_frame_rate_flag;
+	uint8_t bitstream_restriction_flag;
+	uint8_t max_dec_frame_buffering;
+	uint8_t pic_struct_present_flag;
+	uint8_t pic_struct;
+	uint8_t field_pic_flag;
+	uint8_t bottom_field_flag;
+	uint8_t sequence_parameter_set_present_flag;
+	uint8_t picture_parameter_set_present_flag;
+	uint8_t au_delimiter_present_flag;
+	uint8_t end_of_sequence_present_flag;
+	uint8_t end_of_stream_present_flag;
+	uint8_t filler_data_present_flag;
+	uint8_t picture_timing_sei_present_flag;
+	uint8_t buffering_period_sei_present_flag;
+	uint8_t constraint_set0_flag;
+	uint8_t constraint_set1_flag;
+	uint8_t constraint_set2_flag;
+	uint8_t constraint_set3_flag;
+	uint8_t constraint_set4_flag;
+	uint8_t constraint_set5_flag;
+} Edge264Picture;
+
 typedef struct Edge264Frame {
-	const uint8_t *samples[3]; // Y/Cb/Cr planes
-	const uint8_t *samples_mvc[3]; // second view
-	const uint8_t *mb_errors; // reserved for a per-macroblock error-concealment plane (probabilities 0..100, one per macroblock, spaced by stride_mb); NOT YET IMPLEMENTED - always NULL on every frame. Do not branch on it expecting data; when it is wired up, stride_mb must be widened first (see below).
-	int8_t bit_depth_Y;
-	int8_t bit_depth_C;
-	int16_t width_Y;
-	int16_t width_C;
-	int16_t height_Y;
-	int16_t height_C;
-	int16_t stride_Y;
-	int16_t stride_C;
-	int16_t stride_mb; // reserved: intended row stride of the mb_errors plane (unused while mb_errors is always NULL). NOTE: too narrow for the real byte stride - pic_width_in_mbs * sizeof(Edge264Macroblock) overflows int16_t at >=108 macroblocks wide (every 1080p/4K frame). Widen to int32_t (an ABI change) when the mb_errors plane is implemented.
-	int32_t FrameId;
-	int32_t FrameId_mvc; // second view
-	int32_t Poc;
-	int32_t Poc_mvc; // second view
-	int64_t DisplayPoc;
-	int64_t DisplayPoc_mvc; // second view
-	int16_t frame_crop_offsets[4]; // {top,right,bottom,left}, useful to derive the original frame with 16x16 macroblocks
-	void *return_arg;
+	uint32_t npics;
+	Edge264Picture pics[2];
 } Edge264Frame;
 
+typedef struct Edge264Input {
+	const uint8_t *buf;
+	const uint8_t *end;
+	uint64_t pts;
+	uint64_t dts;
+	void* opaque;
+} Edge264Input;
+
 const uint8_t *edge264_find_start_code(const uint8_t *buf, const uint8_t *end, int four_byte);
-Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg, int log_mbs, Edge264AllocCb alloc_cb, Edge264FreeCb free_cb, void *alloc_arg);
-void edge264_flush(Edge264Decoder *dec);
+Edge264Decoder *edge264_alloc(Edge264LogCb log_cb, void *log_arg, int log_mbs, Edge264AllocCb alloc_cb, Edge264FreeCb free_cb, void *alloc_arg);
+void edge264_reset(Edge264Decoder *dec);
 void edge264_free(Edge264Decoder **pdec);
-int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *end, Edge264UnrefCb unref_cb, void *unref_arg);
-int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow);
-void edge264_return_frame(Edge264Decoder *dec, void *return_arg);
+int edge264_decode_NAL(Edge264Decoder *dec, const Edge264Input* input, Edge264UnrefCb unref_cb, void *unref_arg);
+int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out);
 
 #ifdef __cplusplus
 }

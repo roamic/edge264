@@ -155,22 +155,25 @@ static int unsup_NAL(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_a
 
 
 
-Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg, int log_mbs, Edge264AllocCb alloc_cb, Edge264FreeCb free_cb, void *alloc_arg) {
+Edge264Decoder *edge264_alloc(Edge264LogCb log_cb, void *log_arg, int log_mbs, Edge264AllocCb alloc_cb, Edge264FreeCb free_cb, void *alloc_arg) {
 	Edge264Decoder *dec = aligned_malloc(64, sizeof(*dec)); // maximal SIMD type alignment used in edge264
 	if (dec == NULL)
 		return NULL;
 	memset(dec, 0, sizeof(*dec));
+#ifdef HAS_LOGS
 	dec->log_base_us = get_relative_time_us();
+#endif
 	dec->currPic = dec->basePic = -1;
 	dec->PrevRefFrameNum[0] = dec->PrevRefFrameNum[1] = dec->prevFrameId = -1;
-	dec->taskPics_v = dec->get_frame_queue_v[0] = dec->get_frame_queue_v[1] = set8(-1);
-	dec->n_threads = n_threads;
+	dec->get_frame_queue_v[0] = dec->get_frame_queue_v[1] = set8(-1);
 	dec->alloc_cb = alloc_cb && free_cb ? alloc_cb : internal_alloc;
 	dec->free_cb = alloc_cb && free_cb ? free_cb : internal_free;
 	dec->alloc_arg = alloc_arg;
+#ifdef HAS_LOGS
 	dec->log_cb = log_cb;
 	dec->log_arg = log_arg;
-	
+#endif
+
 	// select parser functions based on CPU capabilities and logs mode
 	dec->worker_loop = ADD_VARIANT(worker_loop);
 	for (int i = 0; i < 32; i++)
@@ -233,67 +236,15 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 			return aligned_free(dec), NULL;
 	#endif
 	
-	// get the number of logical cores if requested
-	if (n_threads < 0) {
-		#ifdef _WIN32
-			const char *env = getenv("NUMBER_OF_PROCESSORS");
-			int n_cpus = env != NULL ? atoi(env) : 0;
-		#else
-			int n_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-		#endif
-		n_threads = n_cpus > 0 ? n_cpus : 0; // a failed detection -> single-threaded
-	}
-	// reason: clamp to the fixed-size worker pool and persist the result, because
-	// edge264_free's join loop uses dec->n_threads as its bound (`i < dec->n_threads`).
-	// Leaving a raw value here - the -1 auto-detect sentinel, or an explicit request
-	// larger than the pool - makes the spawn loop write pthread handles past
-	// dec->threads[] straight into the adjacent mutex/condvars, and the join loop
-	// walk the same overrun; both corrupt teardown (the -1 case surfaced as a
-	// Windows/MinGW access violation that glibc happened to tolerate). Derive the
-	// bound from the array size so the cap can never drift from it.
-	int max_threads = sizeof(dec->threads) / sizeof(dec->threads[0]);
-	if (n_threads > max_threads)
-		n_threads = max_threads;
-	dec->n_threads = n_threads;
-	
-	// if multithreading is disabled we are done, otherwise initialize all
-	if (n_threads == 0)
-		return dec;
-	if (pthread_mutex_init(&dec->lock, NULL) == 0) {
-		if (pthread_cond_init(&dec->task_ready, NULL) == 0) {
-			if (pthread_cond_init(&dec->task_progress, NULL) == 0) {
-				if (pthread_cond_init(&dec->task_complete, NULL) == 0) {
-					int i = 0;
-					while (i < n_threads && pthread_create(&dec->threads[i], NULL, dec->worker_loop, (void *)((uintptr_t)dec + i)) == 0)
-						i++;
-					if (i == n_threads) {
-						return dec;
-					}
-					while (i-- > 0)
-						pthread_cancel(dec->threads[i]);
-					pthread_cond_destroy(&dec->task_complete);
-				}
-				pthread_cond_destroy(&dec->task_progress);
-			}
-			pthread_cond_destroy(&dec->task_ready);
-		}
-		pthread_mutex_destroy(&dec->lock);
-	}
-	aligned_free(dec);
-	return NULL;
+	return dec;
 }
 
 
 
-void edge264_flush(Edge264Decoder *dec) {
+void edge264_reset(Edge264Decoder *dec) {
 	if (dec == NULL)
 		return;
-	if (dec->n_threads)
-		pthread_mutex_lock(&dec->lock);
-	flush_frames(dec);
 	clear_decoder(dec);
-	if (dec->n_threads)
-		pthread_mutex_unlock(&dec->lock);
 }
 
 
@@ -302,31 +253,6 @@ void edge264_free(Edge264Decoder **pdec) {
 	Edge264Decoder *dec;
 	if (pdec != NULL && (dec = *pdec) != NULL) {
 		*pdec = NULL;
-		if (dec->n_threads) {
-			// Clean shutdown: signal idle workers to leave their task_ready wait
-			// loop and join them before destroying the sync objects. Cancelling
-			// without joining (and destroying the mutex/conds while threads still
-			// wait on them) is POSIX UB and deadlocks in pthread_cond_destroy.
-			pthread_mutex_lock(&dec->lock);
-			dec->shutdown = 1;
-			pthread_cond_broadcast(&dec->task_ready);
-			pthread_mutex_unlock(&dec->lock);
-			for (int i = 0; i < dec->n_threads; i++)
-				pthread_join(dec->threads[i], NULL);
-			// Workers exit at shutdown without running tasks that were created but
-			// not yet taken (pending_tasks); unlike the flush path, which waits on
-			// busy_tasks, nothing drains them. Call each pending task's unref_cb so
-			// a copied slice NAL (internal_unref_nal) is freed, not leaked here.
-			for (unsigned p = dec->pending_tasks; p; p &= p - 1) {
-				int task_id = __builtin_ctz(p);
-				if (dec->tasks[task_id].unref_cb)
-					dec->tasks[task_id].unref_cb(ECANCELED, dec->tasks[task_id].unref_arg);
-			}
-			pthread_mutex_destroy(&dec->lock);
-			pthread_cond_destroy(&dec->task_ready);
-			pthread_cond_destroy(&dec->task_progress);
-			pthread_cond_destroy(&dec->task_complete);
-		}
 		for (int i = 0; i < 32; i++) {
 			if (dec->samples_buffers[i] != NULL)
 				dec->free_cb(dec->samples_buffers[i], dec->mb_buffers[i], dec->alloc_arg);
@@ -354,10 +280,11 @@ static void internal_unref_nal(int ret, void *nal_base) {
  * to allow wrapping around memory, so the buffer may be close to end of memory
  * without risk.
  */
-int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *end, Edge264UnrefCb unref_cb, void *unref_arg)
+int edge264_decode_NAL(Edge264Decoder *dec, const Edge264Input* input, Edge264UnrefCb unref_cb, void *unref_arg)
 {
+#ifdef HAS_LOGS
 	static const char * const nal_unit_type_names[32] = {
-		[0 ... 31] = "Unknown",
+		[0] = "Unknown",
 		[1] = "Coded slice of a non-IDR picture",
 		[2] = "Coded slice data partition A",
 		[3] = "Coded slice data partition B",
@@ -374,16 +301,17 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 		[14] = "Prefix NAL unit",
 		[15] = "Subset sequence parameter set",
 		[16] = "Depth parameter set",
+		[17 ... 18] = "Unknown",
 		[19] = "Coded slice of an auxiliary coded picture without partitioning",
 		[20] = "Coded slice extension",
 		[21] = "Coded slice extension for a depth view component or a 3D-AVC texture view component",
+		[22 ... 31] = "Unknown",
 	};
+#endif
 	
 	// initial checks before parsing
-	if (dec == NULL || buf == NULL)
+	if (dec == NULL || input->buf == NULL)
 		return EINVAL;
-	if (dec->n_threads)
-		pthread_mutex_lock(&dec->lock);
 
 	// There has to be enough buffer space for any NAL to flush the entire DPB.
 	// get_frame_queue is 16 entries *per view*, and a flush routes base pictures to
@@ -400,63 +328,37 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 	int pending_base = __builtin_popcount(dec->to_get_frames & ~dec->output_frames & ~dec->non_base_frames);
 	int pending_dep = __builtin_popcount(dec->to_get_frames & ~dec->output_frames & dec->non_base_frames);
 	if (queued0 + max(1, pending_base) > 16 || queued1 + max(1, pending_dep) > 16) {
-		if (dec->n_threads)
-			pthread_mutex_unlock(&dec->lock);
 		return ENOBUFS;
 	}
 	
 	// bump all frames at the end of buffer
-	if (__builtin_expect(buf >= end, 0)) {
+	if (__builtin_expect(input->buf >= input->end, 0)) {
 		dec->flushing = 1; // end-of-stream drain: let get_frame emit an unpairable MVC base alone
 		int ret = bump_all_frames(dec);
-		if (dec->n_threads)
-			pthread_mutex_unlock(&dec->lock);
 		return ret ?: ENODATA;
 	}
 	dec->flushing = 0;
 
-	// In the multithreaded path, slice NALs (types 1, 5, 20) are decoded by a
-	// worker thread *after* this call returns, so their bytes must outlive the
-	// caller's buffer. The unref_cb contract documents this, but it is subtle
-	// and easy to miss - a caller that reuses or frees its NAL buffer right
-	// after decode_NAL (correct for single-thread, where decoding is synchronous)
-	// silently corrupts the in-flight slice, desynchronising CABAC and stalling
-	// the DPB. Copy the slice into decoder-owned memory and free it from the
-	// task's unref_cb when the worker is done; the caller's buffer is then free
-	// the moment decode_NAL returns, regardless of how the caller manages it.
-	// The copy must reproduce the buffer environment the bitstream reader relies
-	// on (and which the caller's buffer provides for free): the reader does an
-	// unaligned load from CPB-2 (so the two bytes before the NAL must be readable
-	// and must not spoof a 00 00 0x escape - emulate the 00 00 01 start-code end),
-	// and aligned 16-byte loads around `end` (so the allocation must be 16-byte
-	// aligned and extend past `end`). Hence: 16-byte front pad ending in 00 00 01,
-	// then the NAL, then >=16-byte trailing pad, 16-aligned.
-	uint8_t *nal_base = NULL;
-	if (dec->n_threads && (0x100022 & 1 << (buf[0] & 0x1f))) { // slice types 1, 5, 20
-		size_t nal_len = end - buf;
-		size_t cap = (16 + nal_len + 32 + 15) & ~(size_t)15;
-		if ((nal_base = aligned_malloc(16, cap)) == NULL) {
-			pthread_mutex_unlock(&dec->lock);
-			return ENOMEM;
-		}
-		memset(nal_base, 0, 16);
-		nal_base[15] = 1; // buf[-1]=01, buf[-2]=00, buf[-3]=00 -> a 00 00 01 start code
-		memcpy(nal_base + 16, buf, nal_len);
-		memset(nal_base + 16 + nal_len, 0, cap - 16 - nal_len); // trailing pad for read-ahead
-		buf = nal_base + 16;
-		end = buf + nal_len;
-	}
-
 	// prefill the bitstream cache while parsing the NAL byte header
-	dec->gb.CPB = buf;
-	dec->gb.end = end;
+	dec->gb.CPB = input->buf;
+	dec->gb.end = input->end;
+	dec->timing.pts = input->pts;
+	dec->timing.dts = input->dts;
+	dec->opaque = input->opaque;
 	dec->gb.msb_cache = (size_t)1 << (SIZE_BIT - 1);
 	refill(&dec->gb, 0);
 	dec->nal_ref_idc = dec->gb.msb_cache >> (SIZE_BIT - 3);
 	dec->nal_unit_type = dec->gb.msb_cache >> (SIZE_BIT - 8) & 0x1f;
+	dec->out.sequence_parameter_set_present_flag |= dec->nal_unit_type == 7;
+	dec->out.picture_parameter_set_present_flag |= dec->nal_unit_type == 8;
+	dec->out.au_delimiter_present_flag |= dec->nal_unit_type == 9;
+	dec->out.end_of_sequence_present_flag |= dec->nal_unit_type == 10;
+	dec->out.end_of_stream_present_flag |= dec->nal_unit_type == 11;
+	dec->out.filler_data_present_flag |= dec->nal_unit_type == 12;
 	dec->gb.msb_cache = dec->gb.msb_cache << 8 | 1 << 7;
 	refill(&dec->gb, 0);
 	Parser parser = dec->parse_nal_unit[dec->nal_unit_type];
+#ifdef HAS_LOGS
 	if (dec->log_cb) {
 		dec->log_pos = snprintf(dec->log_buf, sizeof(dec->log_buf),
 			"\n- nal_ref_idc: %u\n"
@@ -464,9 +366,10 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 			dec->nal_ref_idc,
 			dec->nal_unit_type, nal_unit_type_names[dec->nal_unit_type], unsup_if(!parser));
 	}
+#endif
 	// For a copied slice, the task owns the copy and frees it via internal_unref_nal
 	// when the worker finishes; otherwise the caller's unref_cb/arg flow through.
-	int ret = parser(dec, nal_base ? internal_unref_nal : unref_cb, nal_base ? (void *)nal_base : unref_arg);
+	int ret = parser(dec, unref_cb, unref_arg);
 	// printf("nal_unit_type=%d, ret=%d\n\n", dec->nal_unit_type, ret);
 	// Queue the dependent views of already-queued bases on the parsing thread
 	// (idempotent, cheap for non-MVC), so the consumer-side pairing valve in
@@ -476,14 +379,8 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 
 	// Release the caller's NAL buffer on success: non-slices always, and copied
 	// slices too (we hold our own copy, so the caller buffer is already free).
-	if (unref_cb && ret == 0 && (nal_base || !(0x100022 & 1 << dec->nal_unit_type))) // 1, 5 or 20
+	if (unref_cb && ret == 0 && !(0x100022 & 1 << dec->nal_unit_type)) // 1, 5 or 20
 		unref_cb(ret, unref_arg);
-	// A copied slice that created no task (error / ENOBUFS re-feed) has no owner
-	// for the copy - free it here so it does not leak.
-	if (nal_base && ret != 0)
-		aligned_free(nal_base);
-	if (dec->n_threads)
-		pthread_mutex_unlock(&dec->lock);
 	return ret;
 }
 
@@ -520,6 +417,30 @@ static int64_t edge264_unwrap_output_poc(Edge264Decoder *dec, int view, int32_t 
 
 
 
+static void get_picture(Edge264Decoder *dec, int pic, Edge264Picture *out) {
+	*out = dec->out;
+	int top = dec->format.frame_crop_offsets[0];
+	int left = dec->format.frame_crop_offsets[3];
+	int offY = top * dec->format.stride_Y + (dec->format.bit_depth_Y == 8 ? left : left << 1);
+	int topC = dec->sps.chroma_format_idc == 3 ? top : top >> 1;
+	int leftC = dec->sps.chroma_format_idc == 1 ? left >> 1 : left;
+	int offC = dec->plane_size_Y + topC * dec->format.stride_C + (dec->format.bit_depth_C == 8 ? leftC : leftC << 1);
+	assert(dec->to_get_frames & dec->output_frames & 1 << pic);
+	dec->to_get_frames &= ~(1 << pic);
+	out->data[0] = dec->samples_buffers[pic] + offY;
+	out->data[1] = dec->samples_buffers[pic] + offC;
+	out->data[2] = dec->samples_buffers[pic] + offC + (dec->format.stride_C >> 1);
+	out->idr_picture_flag = (dec->frame_idr_flags >> pic) & 1;
+	out->field_pic_flag = (dec->frame_field_flags >> pic) & 1;
+	out->bottom_field_flag = (dec->frame_field_flags >> pic) & 1;
+	out->opaque = dec->frame_args[pic];
+	out->pts = dec->timings[pic].pts;
+	out->dts = dec->timings[pic].dts;
+	out->pic_struct = dec->timings[pic].pic_struct;
+}
+
+
+
 /**
  * By default all frames with POC lower or equal with the last non-reference
  * picture or lower than the last IDR picture are considered for output.
@@ -527,11 +448,9 @@ static int64_t edge264_unwrap_output_poc(Edge264Decoder *dec, int view, int32_t 
  * _ there are more frames to output than max_num_reorder_frames
  * _ there is no empty slot for the next frame
  */
-int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
+int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out) {
 	if (dec == NULL || out == NULL)
 		return EINVAL;
-	if (dec->n_threads)
-		pthread_mutex_lock(&dec->lock);
 	int idx0 = -1;
 	int idx1 = -1;
 	int pic0 = -1;
@@ -585,14 +504,7 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 		// pictures can be queued at their first slice by the immediate-output
 		// or reorder bump) may momentarily have no busy task between two of its
 		// slices, so the scan below alone would let a later frame overtake it.
-		int in_flight = lowest_any_pic == dec->currPic;
-		for (unsigned b = dec->busy_tasks; !in_flight && b; b &= b - 1) {
-			if (dec->taskPics[__builtin_ctz(b)] == lowest_any_pic) {
-				in_flight = 1;
-				break;
-			}
-		}
-		if (in_flight)
+		if (lowest_any_pic == dec->currPic)
 			idx0 = -1;
 	}
 	if (idx0 >= 0) {
@@ -697,40 +609,16 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 			}
 		}
 		if (dec->ssps.BitDepth_Y == 0 || idx1 >= 0 || force_unpaired) {
-		dec->get_frame_queue[0][idx0] = -1;
-		memcpy(out, &dec->out, sizeof(*out)); // GCC-14 crashes on dec->out = format
-		int top = dec->out.frame_crop_offsets[0];
-		int left = dec->out.frame_crop_offsets[3];
-		int offY = top * dec->out.stride_Y + (dec->out.bit_depth_Y == 8 ? left : left << 1);
-		int topC = dec->sps.chroma_format_idc == 3 ? top : top >> 1;
-		int leftC = dec->sps.chroma_format_idc == 1 ? left >> 1 : left;
-		int offC = dec->plane_size_Y + topC * dec->out.stride_C + (dec->out.bit_depth_C == 8 ? leftC : leftC << 1);
-		assert(dec->to_get_frames & dec->output_frames & 1 << pic0);
-		dec->to_get_frames &= ~(1 << pic0);
-		out->samples[0] = dec->samples_buffers[pic0] + offY;
-		out->samples[1] = dec->samples_buffers[pic0] + offC;
-		out->samples[2] = dec->samples_buffers[pic0] + offC + (dec->out.stride_C >> 1);
-		out->FrameId = dec->FrameIds[pic0];
-		out->Poc = dec->FieldOrderCnt[0][pic0];
-		out->Poc_mvc = 0;
-		out->DisplayPoc = edge264_unwrap_output_poc(dec, 0, out->Poc);
-		out->DisplayPoc_mvc = 0;
-		out->return_arg = (void *)((uintptr_t)1 << pic0);
-		if (idx1 >= 0) {
-			dec->get_frame_queue[1][idx1] = -1;
-			assert(dec->to_get_frames & dec->output_frames & 1 << pic1);
-			dec->to_get_frames ^= 1 << pic1;
-			out->samples_mvc[0] = dec->samples_buffers[pic1] + offY;
-			out->samples_mvc[1] = dec->samples_buffers[pic1] + offC;
-			out->samples_mvc[2] = dec->samples_buffers[pic1] + offC + (dec->out.stride_C >> 1);
-			out->FrameId_mvc = dec->FrameIds[pic1];
-			out->Poc_mvc = dec->FieldOrderCnt[0][pic1];
-			out->DisplayPoc_mvc = edge264_unwrap_output_poc(dec, 1, out->Poc_mvc);
-			out->return_arg = (void *)((uintptr_t)1 << pic0 | (uintptr_t)1 << pic1);
-		}
-		res = 0;
-		if (!borrow)
-			dec->output_frames &= ~(uintptr_t)out->return_arg;
+			dec->get_frame_queue[0][idx0] = -1;
+			get_picture(dec, pic0, &out->pics[0]);
+			edge264_unwrap_output_poc(dec, 0, dec->FieldOrderCnt[0][pic0]);
+			if (idx1 >= 0) {
+				dec->get_frame_queue[1][idx1] = -1;
+				get_picture(dec, pic1, &out->pics[1]);
+				edge264_unwrap_output_poc(dec, 1, dec->FieldOrderCnt[0][pic1]);
+			}
+			res = 0;
+			dec->output_frames &= ~((uint32_t)1 << pic0 | (uint32_t)1 << pic1);
 		}
 	}
 	// MVC orphan-dependent liveness valve: the mirror of the unpaired-base valve
@@ -748,12 +636,8 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 	// decoded before its dependent, so a well-formed dependent's base is live
 	// until the pair is emitted together (a display-order / in-flight hold keeps
 	// it live too); this therefore never fires on a conformant stream.
-	int dropped_orphan = 0;
 	if (res != 0 && dec->ssps.BitDepth_Y != 0) {
-		uint32_t inflight = 0;
-		for (unsigned b = dec->busy_tasks; b; b &= b - 1)
-			inflight |= 1u << dec->taskPics[__builtin_ctz(b)];
-		uint32_t live_bases = (dec->to_get_frames | inflight) & ~dec->non_base_frames;
+		uint32_t live_bases = (dec->to_get_frames) & ~dec->non_base_frames;
 		for (int i = 0; i < 16; ++i) {
 			int dep = dec->get_frame_queue[1][i];
 			if (dep < 0)
@@ -769,7 +653,7 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 			// trimmed real 3D-BD stream). Defer the drop: a genuinely orphaned
 			// dependent completes shortly and is dropped on a later call, so
 			// the liveness purpose of this valve is preserved.
-			if (dep == dec->currPic || (inflight & 1u << dep))
+			if (dep == dec->currPic)
 				continue;
 			int32_t base_fn = dec->FrameNums[dep], base_poc = dec->FieldOrderCnt[0][dep];
 			int has_base = 0;
@@ -788,37 +672,11 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 				dec->get_frame_queue[1][i] = -1;
 				dec->to_get_frames &= ~(1u << dep);
 				dec->output_frames &= ~(1u << dep);
-				dropped_orphan = 1;
 			}
 		}
 	}
-	// Livelock guard: when nothing can be delivered because the next frame is
-	// being held for an in-flight dependency (MVC pairing or display order) and
-	// the output queue is full, the caller spins on ENOBUFS. Returning ENOMSG
-	// immediately lets the parsing thread re-take the lock so fast that it
-	// starves the worker threads, which then never finish the very task the held
-	// frame is waiting on. Yield once to a worker instead; the caller's drain
-	// loop retries and the hold resolves as soon as the dependency completes.
-	// Only fires at fullness, so pipelined non-blocking draining is unaffected.
-	if (res != 0 && !dropped_orphan && dec->n_threads && dec->busy_tasks) {
-		int q0 = __builtin_ctz(movemask(dec->get_frame_queue_v[0]) | 1 << 16);
-		int q1 = __builtin_ctz(movemask(dec->get_frame_queue_v[1]) | 1 << 16);
-		int bumpable = max(1, __builtin_popcount(dec->to_get_frames & ~dec->output_frames));
-		if (q0 + q1 + bumpable > 16)
-			progress_or_wait(dec);
-	}
-	if (dec->n_threads)
-		pthread_mutex_unlock(&dec->lock);
 	return res;
 }
-
-
-
-void edge264_return_frame(Edge264Decoder *dec, void *return_arg) {
-	if (dec != NULL)
-		dec->output_frames &= ~(size_t)return_arg;
-}
-
 
 
 const int8_t cabac_context_init[4][1024][2] __attribute__((aligned(16))) = {{

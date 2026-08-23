@@ -2,12 +2,16 @@ static int parse_buffering_period(Edge264Decoder *dec) {
 	get_ue16(&dec->gb, 31);
 	if (!dec->sps.BitDepth_Y) // if SPS wasn't initialized
 		return EBADMSG;
+	dec->out.buffering_period_sei_present_flag = 1;
 	log_dec(dec, "    delay_bits: %u\n", dec->sps.initial_cpb_removal_delay_length);
 	if (dec->sps.nal_hrd_cpb_cnt)
 		log_dec(dec, "    nal_hrd_cpbs:\n");
 	for (int i = dec->sps.nal_hrd_cpb_cnt; i--; ) {
 		int initial_cpb_removal_delay = get_uv(&dec->gb, dec->sps.initial_cpb_removal_delay_length);
 		int initial_cpb_removal_delay_offset = get_uv(&dec->gb, dec->sps.initial_cpb_removal_delay_length);
+		if (i == (dec->sps.nal_hrd_cpb_cnt - 1)) {
+			dec->cpb_sum = initial_cpb_removal_delay;
+		}
 		log_dec(dec, "    - initial_cpb_removal_delay: %u\n"
 			"      initial_cpb_removal_delay_offset: %u\n",
 			initial_cpb_removal_delay, initial_cpb_removal_delay_offset);
@@ -17,6 +21,9 @@ static int parse_buffering_period(Edge264Decoder *dec) {
 	for (int i = dec->sps.vcl_hrd_cpb_cnt; i--; ) {
 		int initial_cpb_removal_delay = get_uv(&dec->gb, dec->sps.initial_cpb_removal_delay_length);
 		int initial_cpb_removal_delay_offset = get_uv(&dec->gb, dec->sps.initial_cpb_removal_delay_length);
+		if (!dec->sps.nal_hrd_cpb_cnt && i == (dec->sps.vcl_hrd_cpb_cnt - 1)) {
+			dec->cpb_sum = initial_cpb_removal_delay;
+		}
 		log_dec(dec, "    - initial_cpb_removal_delay: %u\n"
 			"      initial_cpb_removal_delay_offset: %u\n",
 			initial_cpb_removal_delay, initial_cpb_removal_delay_offset);
@@ -27,6 +34,7 @@ static int parse_buffering_period(Edge264Decoder *dec) {
 
 
 static int parse_pic_timing(Edge264Decoder *dec) {
+#ifdef LOGS
 	static const char * const pic_struct_names[16] = {
 		"progressive frame", "top field", "bottom field", "top then bottom",
 		"bottom then top", "top then bottom then top",
@@ -34,16 +42,25 @@ static int parse_pic_timing(Edge264Decoder *dec) {
 		[9 ... 15] = "Unknown"};
 	static const char * const ct_type_names[4] = {
 		"progressive", "interlaced", [2 ... 3] = "unknown"};
+#endif
 	
+	dec->out.picture_timing_sei_present_flag = 1;
 	if (dec->sps.nal_hrd_cpb_cnt | dec->sps.vcl_hrd_cpb_cnt) {
 		int cpb_removal_delay = get_uv(&dec->gb, dec->sps.cpb_removal_delay_length);
 		int dpb_output_delay = get_uv(&dec->gb, dec->sps.dpb_output_delay_length);
+		if (dec->sps.timing_info_present_flag) {
+			uint64_t tick_us = (uint64_t)dec->sps.num_units_in_tick * 1000000 / dec->sps.time_scale;
+			dec->cpb_sum += cpb_removal_delay;
+			dec->timing.dts = dec->cpb_sum * tick_us;
+			dec->timing.pts = (dec->cpb_sum + dpb_output_delay) * tick_us;
+		}
 		log_dec(dec, "    cpb_removal_delay: %u\n"
 			"    dpb_output_delay: %u\n",
 			cpb_removal_delay, dpb_output_delay);
 	}
 	if (dec->sps.pic_struct_present_flag) {
 		int pic_struct = get_uv(&dec->gb, 4);
+		dec->timing.pic_struct = pic_struct;
 		int NumClockTS = 0x3be95 >> (pic_struct * 2) & 3;
 		log_dec(dec, "    pic_struct: %s (%u)\n",
 			pic_struct_names[pic_struct], pic_struct);
@@ -111,13 +128,15 @@ static int parse_pan_scan_rect(Edge264Decoder *dec) {
 typedef int (*SEI_Parser)(Edge264Decoder *dec);
 int ADD_VARIANT(parse_sei)(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_arg)
 {
+#ifdef LOGS
 	// FIXME reduce array size to minimum!
 	static const char * const payloadType_names[206] = {
-		[0 ... 205] = "Unknown",
 		[0] = "Buffering period",
 		[1] = "Picture timing",
 		[2] = "Pan-scan rectangle",
+		[3 ... 205] = "Unknown",
 	};
+#endif
 	static const SEI_Parser parse_sei_message[206] = {
 		[0] = parse_buffering_period,
 		[1] = parse_pic_timing,

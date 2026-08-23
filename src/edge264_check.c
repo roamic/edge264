@@ -99,12 +99,12 @@ static void parse_NALs(const char *name, const uint8_t *nal, const uint8_t *end,
 		ASSERT(res == expect[i],
 			"%s: NAL at index %d returned %s where %s was expected\n",
 			name, i, ret_to_str(res), ret_to_str(expect[i]));
-		while (!edge264_get_frame(dec, &out, 0))
+		while (!edge264_get_frame(dec, &out))
 			count_frames += 1;
 	}
 	if (post_test)
 		post_test();
-	edge264_flush(dec);
+	edge264_reset(dec);
 }
 
 

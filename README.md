@@ -186,15 +186,14 @@ int main(int argc, char *argv[]) {
 > * `const uint8_t * end` - first invalid byte past the buffer that stops the search
 > * `int four_byte` - if 0 seek a 001 prefix, otherwise seek a 0001
 
-<code>Edge264Decoder * <b>edge264_alloc</b>(n_threads, log_cb, log_arg, log_mbs, alloc_cb, free_cb, alloc_arg)</code>
+<code>Edge264Decoder * <b>edge264_alloc</b>(log_cb, log_arg, log_mbs, alloc_cb, free_cb, alloc_arg)</code>
 
 > Allocate and initialize a decoding context.
-> * `int n_threads` - number of background worker threads, with 0 to disable multithreading and -1 to detect the number of logical cores at runtime
-> * `void (* log_cb)(const char * str, void * log_arg)` - if not NULL, a `fputs`-compatible function pointer that `edge264_decode_NAL` will call to log every header, SEI or macroblock, requiring the `logs` variant (otherwise it fails at runtime), and called from the same thread except for macroblocks in multithreaded decoding
+> * `void (* log_cb)(const char * str, void * log_arg)` - if not NULL, a `fputs`-compatible function pointer that `edge264_decode_NAL` will call to log every header, SEI or macroblock, requiring the `logs` variant (otherwise it fails at runtime)
 > * `void * log_arg` - custom value passed to `log_cb`
 > * `int log_mbs` - set to 1 to enable the logging of macroblocks
-> * `void (* alloc_cb)(void ** samples, unsigned samples_size, void ** mbs, unsigned mbs_size, int errno_on_fail, void * alloc_arg)` - if not NULL, a function pointer that `edge264_decode_NAL` will call (on the same thread) instead of malloc to request allocation of samples and macroblock buffers for a frame (`errno_on_fail` is ENOMEM for mandatory allocations, or ENOBUFS for allocations that may be skipped to save memory but reduce playback smoothness)
-> * `void (* free_cb)(void * samples, void * mbs, void * alloc_arg)` - if not NULL, a function pointer that `edge264_decode_NAL` and `edge264_free` will call (on the same thread) to free buffers allocated through `alloc_cb`
+> * `void (* alloc_cb)(void ** samples, unsigned samples_size, void ** mbs, unsigned mbs_size, int errno_on_fail, void * alloc_arg)` - if not NULL, a function pointer that `edge264_decode_NAL` will call instead of malloc to request allocation of samples and macroblock buffers for a frame (`errno_on_fail` is ENOMEM for mandatory allocations, or ENOBUFS for allocations that may be skipped to save memory but reduce playback smoothness)
+> * `void (* free_cb)(void * samples, void * mbs, void * alloc_arg)` - if not NULL, a function pointer that `edge264_decode_NAL` and `edge264_free` will call to free buffers allocated through `alloc_cb`
 > * `void * alloc_arg` - custom value passed to `alloc_cb` and `free_cb`
 
 <code>int <b>edge264_decode_NAL</b>(dec, buf, end, free_cb, free_arg)</code>
@@ -202,8 +201,8 @@ int main(int argc, char *argv[]) {
 > Decode a single NAL unit of any type.
 > * `Edge264Decoder * dec` - initialized decoding context
 > * `const uint8_t * buf` - first byte of NAL unit (containing `nal_unit_type`)
-> * `const uint8_t * end` - first byte past the buffer
-> * `void (* free_cb)(void * free_arg, int ret)` - function that may be called from another thread to signal the end of parsing and release the NAL buffer (only when returning `0`)
+> * `const uint8_t * end` - first byte past the buffer (passing `buf >= end` will make all buffered frames ready for output with `edge264_get_frame`)
+> * `void (* free_cb)(void * free_arg, int ret)` - function that may be called to signal the end of parsing and release the NAL buffer (only when returning `0`)
 > * `void * free_arg` - custom value that will be passed to `free_cb`
 > Passing `buf >= end` will make all buffered frames ready for output with `edge264_get_frame`.
 
@@ -216,12 +215,11 @@ int main(int argc, char *argv[]) {
 > * `ENODATA` - the function was called with `buf >= end` and there are no frames left to output
 > * `ENOMEM` - `malloc` failed to allocate memory
 
-<code>int <b>edge264_get_frame</b>(dec, out, borrow)</code>
+<code>int <b>edge264_get_frame</b>(dec, out)</code>
 
 > Fetch the next frame ready for output.
 > * `Edge264Decoder * dec` - initialized decoding context
 > * `Edge264Frame *out` - a structure that will be filled with data for the frame returned
-> * `int borrow` - if 0 the frame may be accessed until the next call to `edge264_decode_NAL`, otherwise the frame should be explicitly returned with `edge264_return_frame`. Note that access is not exclusive, it may be used concurrently as reference for other frames.
 
 > Return codes are:
 > * `0` on success (one frame is returned)
@@ -252,15 +250,6 @@ int main(int argc, char *argv[]) {
 > 	void *return_arg;
 > } Edge264Frame;
 > ```
-
-> [!NOTE]
-> The four `Poc` / `DisplayPoc` fields are edge264-mvc's addition to the original edge264 API: `Poc` / `Poc_mvc` are the per-view picture order counts, and `DisplayPoc` / `DisplayPoc_mvc` their stream-monotonic unwrapped values. MVC frames are returned POC-paired (`samples` + `samples_mvc`), in display order.
-
-<code>void <b>edge264_return_frame</b>(dec, return_arg)</code>
-
-> Give back ownership of the frame if it was borrowed from a previous call to `edge264_get_frame`.
-> * `Edge264Decoder * dec` - initialized decoding context
-> * `void * return_arg` - the value stored inside the frame to return
 
 <code>void <b>edge264_flush</b>(dec)</code>
 
