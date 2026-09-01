@@ -7,7 +7,7 @@
 
 #include <assert.h>
 #include <limits.h>
-#include <pthread.h>
+#include <threads.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,6 +15,8 @@
 #include <string.h>
 #include <time.h>
 #ifdef _WIN32
+	#define NOMINMAX
+	#include <Windows.h>
 	#include <processthreadsapi.h>
 	#include <profileapi.h> // QueryPerformanceCounter/Frequency for get_relative_time_us
 	#define ssize_t ptrdiff_t
@@ -49,7 +51,7 @@
 	#include <wasm_simd128.h>
 #endif
 
-#include "../edge264.h"
+#include "edge264.h"
 
 
 
@@ -373,15 +375,15 @@ typedef struct Edge264Decoder {
 	Edge264AllocCb alloc_cb;
 	Edge264FreeCb free_cb;
 	void *alloc_arg;
-	void *(*worker_loop)(void *);
+	int(*worker_loop)(void *);
 	uint8_t *samples_buffers[32];
 	Edge264Macroblock *mb_buffers[32];
 	Parser parse_nal_unit[32];
-	pthread_t threads[16];
-	pthread_mutex_t lock;
-	pthread_cond_t task_ready;
-	pthread_cond_t task_progress; // signals next_deblock_addr has been updated
-	pthread_cond_t task_complete;
+	thrd_t threads[16];
+	mtx_t lock;
+	cnd_t task_ready;
+	cnd_t task_progress; // signals next_deblock_addr has been updated
+	cnd_t task_complete;
 	Edge264Frame out;
 	
 	// general contextual fields
@@ -756,7 +758,7 @@ static const int8_t shz_mask[48] = {
 	static always_inline i16x8 cvthi8s16(i8x16 a) {return (i16x8)ziphi8(a, a) >> 8;}
 	static always_inline i32x4 cvthi16s32(i16x8 a) {return (i32x4)ziphi16(a, a) >> 16;}
 	#ifndef __wasm_simd128__
-		static always_inline size_t shld(size_t l, size_t h, size_t i) {asm("shld %%cl, %1, %0" : "+rm" (h) : "r" (l), "c" (i)); return h;}
+		static always_inline size_t shld(size_t l, size_t h, size_t i) {__asm__("shld %%cl, %1, %0" : "+rm" (h) : "r" (l), "c" (i)); return h;}
 	#else
 		static always_inline size_t shld(size_t l, size_t h, int i) {return h << i | l >> 1 >> (~i & (SIZE_BIT - 1));}
 	#endif
@@ -1376,13 +1378,17 @@ static noinline void parse_slice_data_cavlc(Edge264Context *ctx);
 static noinline void parse_slice_data_cabac(Edge264Context *ctx);
 
 // edge264_headers.c
-#ifndef ADD_VARIANT
-	#define ADD_VARIANT(f) f
+#ifndef FN_VARIANT
+#define ADD_VARIANT(f) f
+#else
+#define CONCAT(f, v) f ## _ ## v
+#define EVALUATE(f, var) CONCAT(f, var)
+#define ADD_VARIANT(f) EVALUATE(f, FN_VARIANT)
 #endif
-void *worker_loop(void *d);
-void *worker_loop_v2(void *d);
-void *worker_loop_v3(void *d);
-void *worker_loop_log(void *d);
+int worker_loop(void *d);
+int worker_loop_v2(void *d);
+int worker_loop_v3(void *d);
+int worker_loop_log(void *d);
 int ignore_NAL_log(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_arg);
 int unsup_NAL_log(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_arg);
 int parse_slice_layer_without_partitioning(Edge264Decoder *dec, Edge264UnrefCb unref_cb, void *unref_arg);

@@ -259,25 +259,27 @@ Edge264Decoder *edge264_alloc(int n_threads, Edge264LogCb log_cb, void *log_arg,
 	// if multithreading is disabled we are done, otherwise initialize all
 	if (n_threads == 0)
 		return dec;
-	if (pthread_mutex_init(&dec->lock, NULL) == 0) {
-		if (pthread_cond_init(&dec->task_ready, NULL) == 0) {
-			if (pthread_cond_init(&dec->task_progress, NULL) == 0) {
-				if (pthread_cond_init(&dec->task_complete, NULL) == 0) {
+	if (mtx_init(&dec->lock, mtx_plain) == 0) {
+		if (cnd_init(&dec->task_ready) == 0) {
+			if (cnd_init(&dec->task_progress) == 0) {
+				if (cnd_init(&dec->task_complete) == 0) {
 					int i = 0;
-					while (i < n_threads && pthread_create(&dec->threads[i], NULL, dec->worker_loop, (void *)((uintptr_t)dec + i)) == 0)
+					while (i < n_threads && thrd_create(&dec->threads[i], dec->worker_loop, (void *)((uintptr_t)dec + i)) == 0)
 						i++;
 					if (i == n_threads) {
 						return dec;
 					}
-					while (i-- > 0)
-						pthread_cancel(dec->threads[i]);
-					pthread_cond_destroy(&dec->task_complete);
+					// while (i-- > 0) {
+					// 	pthread_cancel(dec->threads[i]);
+					dec->shutdown = 1;
+					cnd_broadcast(&dec->task_ready);
+					cnd_destroy(&dec->task_complete);
 				}
-				pthread_cond_destroy(&dec->task_progress);
+				cnd_destroy(&dec->task_progress);
 			}
-			pthread_cond_destroy(&dec->task_ready);
+			cnd_destroy(&dec->task_ready);
 		}
-		pthread_mutex_destroy(&dec->lock);
+		mtx_destroy(&dec->lock);
 	}
 	aligned_free(dec);
 	return NULL;
@@ -289,11 +291,11 @@ void edge264_flush(Edge264Decoder *dec) {
 	if (dec == NULL)
 		return;
 	if (dec->n_threads)
-		pthread_mutex_lock(&dec->lock);
+		mtx_lock(&dec->lock);
 	flush_frames(dec);
 	clear_decoder(dec);
 	if (dec->n_threads)
-		pthread_mutex_unlock(&dec->lock);
+		mtx_unlock(&dec->lock);
 }
 
 
@@ -306,13 +308,13 @@ void edge264_free(Edge264Decoder **pdec) {
 			// Clean shutdown: signal idle workers to leave their task_ready wait
 			// loop and join them before destroying the sync objects. Cancelling
 			// without joining (and destroying the mutex/conds while threads still
-			// wait on them) is POSIX UB and deadlocks in pthread_cond_destroy.
-			pthread_mutex_lock(&dec->lock);
+			// wait on them) is POSIX UB and deadlocks in cnd_destroy.
+			mtx_lock(&dec->lock);
 			dec->shutdown = 1;
-			pthread_cond_broadcast(&dec->task_ready);
-			pthread_mutex_unlock(&dec->lock);
+			cnd_broadcast(&dec->task_ready);
+			mtx_unlock(&dec->lock);
 			for (int i = 0; i < dec->n_threads; i++)
-				pthread_join(dec->threads[i], NULL);
+				thrd_join(dec->threads[i], NULL);
 			// Workers exit at shutdown without running tasks that were created but
 			// not yet taken (pending_tasks); unlike the flush path, which waits on
 			// busy_tasks, nothing drains them. Call each pending task's unref_cb so
@@ -322,10 +324,10 @@ void edge264_free(Edge264Decoder **pdec) {
 				if (dec->tasks[task_id].unref_cb)
 					dec->tasks[task_id].unref_cb(ECANCELED, dec->tasks[task_id].unref_arg);
 			}
-			pthread_mutex_destroy(&dec->lock);
-			pthread_cond_destroy(&dec->task_ready);
-			pthread_cond_destroy(&dec->task_progress);
-			pthread_cond_destroy(&dec->task_complete);
+			mtx_destroy(&dec->lock);
+			cnd_destroy(&dec->task_ready);
+			cnd_destroy(&dec->task_progress);
+			cnd_destroy(&dec->task_complete);
 		}
 		for (int i = 0; i < 32; i++) {
 			if (dec->samples_buffers[i] != NULL)
@@ -383,7 +385,7 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 	if (dec == NULL || buf == NULL)
 		return EINVAL;
 	if (dec->n_threads)
-		pthread_mutex_lock(&dec->lock);
+		mtx_lock(&dec->lock);
 
 	// There has to be enough buffer space for any NAL to flush the entire DPB.
 	// get_frame_queue is 16 entries *per view*, and a flush routes base pictures to
@@ -401,7 +403,7 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 	int pending_dep = __builtin_popcount(dec->to_get_frames & ~dec->output_frames & dec->non_base_frames);
 	if (queued0 + max(1, pending_base) > 16 || queued1 + max(1, pending_dep) > 16) {
 		if (dec->n_threads)
-			pthread_mutex_unlock(&dec->lock);
+			mtx_unlock(&dec->lock);
 		return ENOBUFS;
 	}
 	
@@ -410,7 +412,7 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 		dec->flushing = 1; // end-of-stream drain: let get_frame emit an unpairable MVC base alone
 		int ret = bump_all_frames(dec);
 		if (dec->n_threads)
-			pthread_mutex_unlock(&dec->lock);
+			mtx_unlock(&dec->lock);
 		return ret ?: ENODATA;
 	}
 	dec->flushing = 0;
@@ -436,7 +438,7 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 		size_t nal_len = end - buf;
 		size_t cap = (16 + nal_len + 32 + 15) & ~(size_t)15;
 		if ((nal_base = aligned_malloc(16, cap)) == NULL) {
-			pthread_mutex_unlock(&dec->lock);
+			mtx_unlock(&dec->lock);
 			return ENOMEM;
 		}
 		memset(nal_base, 0, 16);
@@ -483,7 +485,7 @@ int edge264_decode_NAL(Edge264Decoder *dec, const uint8_t *buf, const uint8_t *e
 	if (nal_base && ret != 0)
 		aligned_free(nal_base);
 	if (dec->n_threads)
-		pthread_mutex_unlock(&dec->lock);
+		mtx_unlock(&dec->lock);
 	return ret;
 }
 
@@ -531,7 +533,7 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 	if (dec == NULL || out == NULL)
 		return EINVAL;
 	if (dec->n_threads)
-		pthread_mutex_lock(&dec->lock);
+		mtx_lock(&dec->lock);
 	int idx0 = -1;
 	int idx1 = -1;
 	int pic0 = -1;
@@ -808,7 +810,7 @@ int edge264_get_frame(Edge264Decoder *dec, Edge264Frame *out, int borrow) {
 			progress_or_wait(dec);
 	}
 	if (dec->n_threads)
-		pthread_mutex_unlock(&dec->lock);
+		mtx_unlock(&dec->lock);
 	return res;
 }
 

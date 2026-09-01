@@ -315,20 +315,20 @@ $(LIBNAME): $(OBJNAMES)
 endif
 
 # ---- Test executable ---------------------------------------------------------
-edge264_test$(EXE): src/edge264_test.c edge264.h src/edge264_internal.h $(LIBNAME)
+edge264_test$(EXE): src/edge264_test.c include/edge264.h src/edge264_internal.h $(LIBNAME)
 	$(Q)$(CCLD) src/edge264_test.c $(CPPFLAGS) $(CFLAGS) $(EXEFLAGS) -o $@
 
 # ---- Object files ------------------------------------------------------------
-edge264.o: edge264.h src/*
+edge264.o: include/edge264.h src/*
 	$(Q)$(CC) src/edge264.c -c $(CPPFLAGS) $(CFLAGS) $(OBJFLAGS) $(RUNTIME_TESTS) -o $@
 
-edge264_headers_v2.o: edge264.h src/*
+edge264_headers_v2.o: include/edge264.h src/*
 	$(Q)$(CC) src/edge264_headers.c -c $(CPPFLAGS) $(CFLAGS) $(OBJFLAGS) -march=x86-64-v2 "-DADD_VARIANT(f)=f##_v2" -o $@
 
-edge264_headers_v3.o: edge264.h src/*
+edge264_headers_v3.o: include/edge264.h src/*
 	$(Q)$(CC) src/edge264_headers.c -c $(CPPFLAGS) $(CFLAGS) $(OBJFLAGS) -march=x86-64-v3 "-DADD_VARIANT(f)=f##_v3" -o $@
 
-edge264_headers_log.o: edge264.h src/*
+edge264_headers_log.o: include/edge264.h src/*
 	$(Q)$(CC) src/edge264_headers.c -c $(CPPFLAGS) $(CFLAGS) $(OBJFLAGS) -DLOGS "-DADD_VARIANT(f)=f##_log" -o $@
 
 
@@ -341,7 +341,7 @@ edge264_headers_log.o: edge264.h src/*
 install: $(LIBNAME)
 	$(Q)install -d $(DESTDIR)$(libdir) $(DESTDIR)$(includedir) $(DESTDIR)$(libdir)/pkgconfig
 	$(Q)install -m 644 $(LIBNAME) $(DESTDIR)$(libdir)/
-	$(Q)install -m 644 edge264.h  $(DESTDIR)$(includedir)/
+	$(Q)install -m 644 include/edge264.h  $(DESTDIR)$(includedir)/
 ifeq ($(OS),linux)
   ifneq ($(STATIC),yes)
 	$(Q)ln -sf $(LIBNAME) $(DESTDIR)$(libdir)/libedge264.so
@@ -406,7 +406,7 @@ else
 	$(Q)$(MAKE) --no-print-directory check-edge264-test-liveness
 endif
 
-edge264_check$(EXE): src/edge264_check.c edge264.h src/edge264_internal.h $(LIBNAME)
+edge264_check$(EXE): src/edge264_check.c include/edge264.h src/edge264_internal.h $(LIBNAME)
 	$(Q)$(CCLD) src/edge264_check.c $(CPPFLAGS) $(CFLAGS) $(EXEFLAGS) -o $@
 
 # Committed decode-regression over the bundled JVT conformance fixtures
@@ -434,7 +434,7 @@ ifneq ($(OS),wasm)
 	$(Q)EDGE264_THREADS=-1 ./conformance_check$(EXE) run tests/conformance/manifest.txt tests/conformance
 endif
 
-conformance_check$(EXE): tests/conformance_check.c edge264.h $(LIBNAME)
+conformance_check$(EXE): tests/conformance_check.c include/edge264.h $(LIBNAME)
 	$(Q)$(CCLD) -I. tests/conformance_check.c $(CPPFLAGS) $(CFLAGS) $(EXEFLAGS) -o $@
 
 # Committed liveness regression over the bundled damaged-stream fixtures
@@ -449,7 +449,7 @@ ifneq ($(OS),wasm)
 	$(Q)EDGE264_THREADS=-1 ./liveness_check$(EXE) run tests/liveness/manifest.txt tests/liveness
 endif
 
-liveness_check$(EXE): tests/liveness_check.c edge264.h $(LIBNAME)
+liveness_check$(EXE): tests/liveness_check.c include/edge264.h $(LIBNAME)
 	$(Q)$(CCLD) -I. tests/liveness_check.c $(CPPFLAGS) $(CFLAGS) $(EXEFLAGS) -o $@
 
 # Native edge264_test stream-input regression. Compares regular-file mmap,
@@ -481,7 +481,7 @@ endif
 check-asan: asan_check$(EXE)
 	$(Q)ASAN_OPTIONS=detect_leaks=0 timeout 90 ./asan_check$(EXE) run tests/asan/manifest.txt tests/asan
 
-asan_check$(EXE): tests/asan_check.c edge264.h $(LIBNAME)
+asan_check$(EXE): tests/asan_check.c include/edge264.h $(LIBNAME)
 	$(Q)$(CCLD) -I. tests/asan_check.c $(CPPFLAGS) $(CFLAGS) $(EXEFLAGS) -o $@
 
 .PHONY: gentests

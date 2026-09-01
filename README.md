@@ -515,7 +515,7 @@ Multithreaded decoding is the headline addition. Call `edge264_alloc` with `n_th
 
 | Fix | Failure mode it removes |
 |---|---|
-| Join worker threads on teardown instead of cancel-and-destroy | `edge264_free` deadlocked in `pthread_cond_destroy` after every multithreaded decode |
+| Join worker threads on teardown instead of cancel-and-destroy | `edge264_free` deadlocked in `cnd_destroy` after every multithreaded decode |
 | Hold an MVC base frame until its lagging dependent view is ready | dependent view stranded in its queue -> hard stall on MVC streams under thread contention |
 | Emit frames in monotonic display order, waiting on the in-flight earliest | out-of-order output / ballooning `DisplayPoc` across a GOP boundary under multithreading |
 | Make `next_deblock_addr` accesses atomic (acquire/release) | data race on the deblock-frontier / completion flag (benign on x86-64, torn/stale on ARM) |

@@ -1844,7 +1844,7 @@ static noinline void CAFUNC(parse_slice_data)
 					(ctx->t.disable_deblocking_filter_idc != 1) ? ctx->t.next_deblock_addr : ctx->CurrMbAddr,
 					__ATOMIC_RELEASE);
 				// not locking mutex here is fine since the last progress broadcast will lock it
-				pthread_cond_broadcast(&ctx->d->task_progress);
+				cnd_broadcast(&ctx->d->task_progress);
 			}
 			if (ctx->mby >= ctx->t.pic_height_in_mbs)
 				return;

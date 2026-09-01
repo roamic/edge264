@@ -568,7 +568,7 @@ static void recover_slice(Edge264Context *ctx, int currPic) {
  * This function is the entry point for worker threads, where they consume
  * tasks continuously until stopped by the parent process.
  */
-void *ADD_VARIANT(worker_loop)(void *arg) {
+int ADD_VARIANT(worker_loop)(void *arg) {
 	Edge264Context c;
 	c.d = (void *)((uintptr_t)arg & -16);
 	c.thread_id = c.d->n_threads ? (uintptr_t)arg & 15 : -1;
@@ -578,14 +578,14 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 	c.log_indent = c.d->n_threads ? "  " : "    ";
 	c.log_pos = 0;
 	if (c.thread_id >= 0)
-		pthread_mutex_lock(&c.d->lock);
+		mtx_lock(&c.d->lock);
 	while (1) {
 		// wait until a task becomes available and reserve it
 		while (c.thread_id >= 0 && !c.d->ready_tasks && !c.d->shutdown)
-			pthread_cond_wait(&c.d->task_ready, &c.d->lock);
+			cnd_wait(&c.d->task_ready, &c.d->lock);
 		if (c.thread_id >= 0 && c.d->shutdown) { // edge264_free requested a clean exit
-			pthread_mutex_unlock(&c.d->lock);
-			return NULL;
+			mtx_unlock(&c.d->lock);
+			return 0;
 		}
 		assert((unsigned)c.d->ready_tasks - 1 < 65535); // 0 < ready_tasks < 65536
 		int task_id = __builtin_ctz(c.d->ready_tasks); // FIXME arbitrary selection for now
@@ -593,7 +593,7 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		c.d->pending_tasks &= ~(1 << task_id);
 		c.d->ready_tasks &= ~(1 << task_id);
 		if (c.thread_id >= 0)
-			pthread_mutex_unlock(&c.d->lock);
+			mtx_unlock(&c.d->lock);
 		unsigned long long clock_start = get_relative_time_us() - c.log_base_us;
 		c.t = c.d->tasks[task_id];
 		unsigned approx_byte_size = c.t.gb.end - c.t.gb.CPB;
@@ -667,7 +667,7 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		if (__atomic_load_n(&c.d->next_deblock_addr[currPic], __ATOMIC_ACQUIRE) >= c.t.first_mb_in_slice &&
 		    !(c.t.disable_deblocking_filter_idc == 0 && c.t.next_deblock_addr < 0)) {
 			__atomic_store_n(&c.d->next_deblock_addr[currPic], c.CurrMbAddr, __ATOMIC_RELEASE);
-			pthread_cond_broadcast(&c.d->task_progress);
+			cnd_broadcast(&c.d->task_progress);
 		}
 
 		// deblock the rest of the frame if all mbs have been decoded correctly
@@ -719,22 +719,22 @@ void *ADD_VARIANT(worker_loop)(void *arg) {
 		
 		// if multi-threaded, check if we are the last task to touch this frame and ensure it is complete
 		if (c.thread_id >= 0) {
-			pthread_mutex_lock(&c.d->lock);
-			pthread_cond_signal(&c.d->task_complete);
+			mtx_lock(&c.d->lock);
+			cnd_signal(&c.d->task_complete);
 			if (remaining_mbs == 0) {
-				pthread_cond_broadcast(&c.d->task_progress);
+				cnd_broadcast(&c.d->task_progress);
 				c.d->ready_tasks = ready_tasks(c.d);
 				if (c.d->ready_tasks)
-					pthread_cond_broadcast(&c.d->task_ready);
+					cnd_broadcast(&c.d->task_ready);
 			}
 		}
 		c.d->busy_tasks &= ~(1 << task_id);
 		c.d->task_dependencies[task_id] = 0;
 		c.d->taskPics[task_id] = -1;
 		if (c.thread_id < 0)
-			return (void *)ret;
+			return ret;
 	}
-	return NULL;
+	return 0;
 }
 
 
@@ -1189,7 +1189,7 @@ static int release_terminal_task_dependencies(Edge264Decoder *dec) {
 	if (terminal) {
 		dec->ready_tasks = ready_tasks(dec);
 		if (dec->ready_tasks && dec->n_threads)
-			pthread_cond_broadcast(&dec->task_ready);
+			cnd_broadcast(&dec->task_ready);
 	}
 	return terminal != 0;
 }
@@ -1200,7 +1200,7 @@ static int release_terminal_task_dependencies(Edge264Decoder *dec) {
 static void progress_or_wait(Edge264Decoder *dec) {
 	if (release_terminal_task_dependencies(dec) && dec->ready_tasks)
 		return;
-	pthread_cond_wait(&dec->task_complete, &dec->lock);
+	cnd_wait(&dec->task_complete, &dec->lock);
 }
 
 
@@ -1620,7 +1620,7 @@ int ADD_VARIANT(parse_slice_layer_without_partitioning)(Edge264Decoder *dec, Edg
 		"  decode_NAL_result: %s\n" : t->pps.entropy_coding_mode_flag ?
 		"  macroblocks_cabac:\n" : "  macroblocks_cavlc:\n", 0);
 	if (dec->n_threads) {
-		pthread_cond_signal(&dec->task_ready);
+		cnd_signal(&dec->task_ready);
 	} else {
 		if (!dec->ready_tasks) {
 			// Keep damaged-stream concealment deterministic across threading
